@@ -6,6 +6,7 @@ via the Model Context Protocol (stdio transport).
 
 Tools:
     recall         — search memory with hybrid search (vector + full-text + RRF)
+    recall_exact   — literal substring search for exact wording
     remember       — store a new memory
     forget         — soft-delete a memory chunk
     memory_status  — system health + statistics
@@ -23,6 +24,7 @@ import hashlib
 import json
 import logging
 import sys
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -285,6 +287,127 @@ async def recall(
 
     except Exception as e:
         logger.exception("recall failed")
+        return _dumps({"status": "error", "results": [], "message": f"Search failed: {e}"})
+
+
+# ---------------------------------------------------------------------------
+# Tool: recall_exact
+# ---------------------------------------------------------------------------
+
+
+def _escape_like(text: str) -> str:
+    """Escape LIKE wildcards so the query matches as a literal substring."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+@mcp.tool()
+async def recall_exact(
+    query: str,
+    spaces: list[str] | None = None,
+    limit: int = 10,
+    max_tokens: int = 2000,
+) -> str:
+    """
+    Search memories for chunks that contain the query as literal text.
+
+    Case-insensitive substring match — no embeddings, no ranking. Use it when
+    you know exact wording (an identifier, path, name, or error string) and
+    need ground truth on whether it is stored, or to retrieve that specific
+    memory. Complements recall, whose ranking can miss exact identifiers.
+    Results are budgeted to fit within max_tokens.
+
+    Args:
+        query: The exact text to search for. Wildcards (%, _) are matched
+                literally.
+        spaces: Filter to specific memory spaces (e.g. ["default", "projects"]).
+                If omitted, searches all spaces.
+        limit: Maximum number of results (default 10, max 50).
+        max_tokens: Token budget for results (default 2000).
+    """
+    if not query.strip():
+        return _dumps({"status": "error", "results": [], "message": "Query must not be empty."})
+
+    if not await _ensure_db():
+        return _dumps(
+            {
+                "status": "offline",
+                "results": [],
+                "message": "Database is not available.",
+            }
+        )
+
+    try:
+        space_ids = await resolve_space_names(spaces) if spaces else None
+
+        limit = min(max(limit, 1), 50)
+        max_tokens = min(max(max_tokens, 200), 8000)
+
+        where = ["(c.metadata->>'forgotten')::boolean IS NOT TRUE", "c.content ILIKE %s"]
+        params: list = ["%" + _escape_like(query) + "%"]
+
+        # Unknown space names resolve to []; return zero rows rather than
+        # silently widening to every space (same semantics as hybrid_search).
+        if space_ids is not None:
+            if not space_ids:
+                return _dumps(
+                    {"status": "ok", "results": [], "total_results": 0, "results_shown": 0}
+                )
+            where.append(f"c.space_id IN ({', '.join(['%s'] * len(space_ids))})")
+            params.extend(space_ids)
+
+        params.append(limit)
+
+        start = time.perf_counter()
+        rows = await fetch_all(
+            f"""
+            SELECT c.id AS chunk_id, c.content, c.speaker, c.source, c.created_at,
+                   ms.name AS space, c.metadata
+            FROM chunks c
+            JOIN memory_spaces ms ON ms.id = c.space_id
+            WHERE {" AND ".join(where)}
+            ORDER BY c.created_at DESC
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+
+        await log_query(query, space_ids or None, [], elapsed_ms)
+
+        formatted = []
+        for row in rows:
+            meta = row.get("metadata") or {}
+            entry = {
+                "chunk_id": str(row["chunk_id"]),
+                "content": row["content"],
+                "space": row["space"],
+                "speaker": row["speaker"],
+                "source": row["source"],
+                "created_at": str(row["created_at"]) if row["created_at"] else None,
+            }
+            if meta.get("heading"):
+                entry["section_heading"] = meta["heading"]
+            formatted.append(entry)
+
+        budgeted, was_truncated = _budget_results(formatted, max_tokens)
+
+        response = {
+            "status": "ok",
+            "results": budgeted,
+            "total_results": len(rows),
+            "results_shown": len(budgeted),
+            "query_time_ms": elapsed_ms,
+        }
+        if was_truncated:
+            response["note"] = (
+                f"Some results were truncated to fit within {max_tokens} token budget. "
+                "Use max_tokens to increase."
+            )
+
+        return _dumps(response, indent=2)
+
+    except Exception as e:
+        logger.exception("recall_exact failed")
         return _dumps({"status": "error", "results": [], "message": f"Search failed: {e}"})
 
 
