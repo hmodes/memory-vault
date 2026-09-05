@@ -6,6 +6,7 @@ via the Model Context Protocol (stdio transport).
 
 Tools:
     recall         — search memory with hybrid search (vector + full-text + RRF)
+    recall_exact   — literal substring search for exact wording
     remember       — store a new memory
     forget         — soft-delete a memory chunk
     memory_status  — system health + statistics
@@ -23,6 +24,7 @@ import hashlib
 import json
 import logging
 import sys
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,6 +52,7 @@ from memory_vault.models.db import (  # noqa: E402
 from memory_vault.services.embedding import MODEL_NAME, embed  # noqa: E402
 from memory_vault.services.ingestion import _run_extraction  # noqa: E402
 from memory_vault.services.search import (  # noqa: E402
+    SearchResult,
     hybrid_search,
     log_query,
     parse_since,
@@ -285,6 +288,172 @@ async def recall(
 
     except Exception as e:
         logger.exception("recall failed")
+        return _dumps({"status": "error", "results": [], "message": f"Search failed: {e}"})
+
+
+# ---------------------------------------------------------------------------
+# Tool: recall_exact
+# ---------------------------------------------------------------------------
+
+
+def _escape_like(text: str) -> str:
+    """Escape LIKE wildcards so the query matches as a literal substring."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+@mcp.tool()
+async def recall_exact(
+    query: str,
+    spaces: list[str] | None = None,
+    limit: int = 10,
+    max_tokens: int = 2000,
+) -> str:
+    """
+    Search memories for chunks that contain the query as literal text.
+
+    Case-insensitive substring match (per the database collation, with no
+    unicode normalisation — an NFC query will not find NFD-stored text) — no
+    embeddings, no ranking. Use it when you know exact wording (an identifier,
+    path, name, or error string) and need ground truth on whether it is
+    stored, or to retrieve that specific memory. Complements recall, whose
+    ranking can miss exact identifiers. Results are budgeted to fit within
+    max_tokens.
+
+    Matches chunk content only (not metadata or headings), newest-first, at
+    most `limit` results — not exhaustive. `more_matches` says when further
+    matches exist beyond the page.
+
+    Args:
+        query: The exact text to search for. Wildcards (%, _) are matched
+                literally.
+        spaces: Filter to specific memory spaces (e.g. ["default", "projects"]).
+                If omitted, searches all spaces.
+        limit: Maximum number of results (default 10, max 50).
+        max_tokens: Token budget for results (default 2000, clamped to 200-8000).
+    """
+    if not query.strip():
+        return _dumps({"status": "error", "results": [], "message": "Query must not be empty."})
+    if len(query) > 500:
+        return _dumps(
+            {"status": "error", "results": [], "message": "Query too long (max 500 characters)."}
+        )
+
+    if not await _ensure_db():
+        return _dumps(
+            {
+                "status": "offline",
+                "results": [],
+                "message": "Database is not available.",
+            }
+        )
+
+    try:
+        space_ids = await resolve_space_names(spaces) if spaces else None
+
+        limit = min(max(limit, 1), 50)
+        max_tokens = min(max(max_tokens, 200), 8000)
+
+        # E'\\' is the portable one-character backslash literal: an E-string
+        # reads the same with standard_conforming_strings on AND off, unlike
+        # a plain quoted backslash.
+        where = [
+            "(c.metadata->>'forgotten')::boolean IS NOT TRUE",
+            "c.content ILIKE %s ESCAPE E'\\\\'",
+        ]
+        params: list = ["%" + _escape_like(query) + "%"]
+
+        # Unknown space names resolve to []; a hard-false predicate returns
+        # zero rows rather than silently widening to every space (same
+        # semantics as hybrid_search), through the common response/logging
+        # path rather than a special-cased early return.
+        if space_ids is not None:
+            if space_ids:
+                where.append(f"c.space_id IN ({', '.join(['%s'] * len(space_ids))})")
+                params.extend(space_ids)
+            else:
+                where.append("false")
+
+        # Fetch one extra row to report whether more matches exist beyond
+        # the page; total_results is the page size, not the full count.
+        params.append(limit + 1)
+
+        start = time.perf_counter()
+        rows = await fetch_all(
+            f"""
+            SELECT c.id AS chunk_id, c.content, c.speaker, c.source, c.created_at,
+                   ms.name AS space, c.metadata
+            FROM chunks c
+            JOIN memory_spaces ms ON ms.id = c.space_id
+            WHERE {" AND ".join(where)}
+            ORDER BY c.created_at DESC, c.id DESC
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+
+        more_matches = len(rows) > limit
+        rows = rows[:limit]
+
+        # log_query derives result_count and top_similarity from its results
+        # argument; pass the real rows so successful exact searches are not
+        # logged as zero-result misses. Exact search computes no vector
+        # similarity, so it is left None (NULL in query_log).
+        logged = [
+            SearchResult(
+                chunk_id=str(row["chunk_id"]),
+                content=row["content"],
+                similarity=None,
+                speaker=row["speaker"],
+                space=row["space"],
+                source=row["source"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+        await log_query(query, space_ids, logged, elapsed_ms)
+
+        formatted = []
+        for row in rows:
+            meta = row.get("metadata") or {}
+            entry = {
+                "chunk_id": str(row["chunk_id"]),
+                "content": row["content"],
+                "space": row["space"],
+                "speaker": row["speaker"],
+                "source": row["source"],
+                "created_at": str(row["created_at"]) if row["created_at"] else None,
+            }
+            if meta.get("heading"):
+                entry["section_heading"] = meta["heading"]
+            formatted.append(entry)
+
+        budgeted, was_truncated = _budget_results(formatted, max_tokens)
+
+        # An exact-lookup tool must not silently return content that differs
+        # from what is stored: mark every entry the budgeter shortened.
+        original_lengths = {e["chunk_id"]: len(e["content"]) for e in formatted}
+        for entry in budgeted:
+            entry["truncated"] = len(entry["content"]) < original_lengths[entry["chunk_id"]]
+
+        response = {
+            "status": "ok",
+            "results": budgeted,
+            "total_results": len(rows),
+            "results_shown": len(budgeted),
+            "more_matches": more_matches,
+            "query_time_ms": elapsed_ms,
+        }
+        if was_truncated:
+            response["note"] = (
+                f"Some results were truncated to fit within {max_tokens} token budget. "
+                "Use max_tokens to increase."
+            )
+
+        return _dumps(response, indent=2)
+
+    except Exception as e:
+        logger.exception("recall_exact failed")
         return _dumps({"status": "error", "results": [], "message": f"Search failed: {e}"})
 
 
