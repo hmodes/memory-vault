@@ -67,15 +67,16 @@ async def test_slash_compound_splits_into_word_lexemes():
     assert not any("/" in word for word in lex), f"slash survived in lexemes: {lex}"
 
 
-async def test_exact_identifier_tsquery_finds_chunk():
-    # The query side splits "ANTHROPIC_DEFAULT_OPUS_MODEL" into plain words;
-    # before the fix the content side kept "opus/sonnet/haiku_model" whole,
-    # so this AND-query matched zero rows even though the identifier appears
-    # verbatim in the chunk.
+async def test_split_identifier_query_finds_chunk():
+    # The live failure this migration fixes: querying one identifier form
+    # while the chunk stores another with the same words. The query side
+    # ANDs plain words; before the fix the content side kept
+    # "opus/sonnet/haiku_model" whole, so the AND matched zero rows.
+    # Word-level semantics (not phrase): any chunk carrying all the words
+    # matches — that is _build_tsquery's existing contract.
     cid = await _store("The failing pin was ANTHROPIC_DEFAULT_OPUS/SONNET/HAIKU_MODEL.")
 
     tsq = _build_tsquery("ANTHROPIC_DEFAULT_OPUS_MODEL")
-    assert tsq is not None
     assert await _fts_matches(tsq, cid)
 
 
@@ -85,18 +86,20 @@ async def test_version_string_is_findable():
     cid = await _store("Upgraded the vault stack to 1.18.28 today.")
 
     tsq = _build_tsquery("1.18.28")
-    assert tsq is not None
     assert await _fts_matches(tsq, cid)
 
 
-async def test_hyphenated_name_is_findable():
+async def test_hyphenated_compound_lexeme_removed():
+    # Not a recall fix: the parser already emits hyphen-part lexemes
+    # ("memory-vault" -> memori + memory-vault + vault), so recall worked
+    # before. Normalisation removes the compound lexeme so the index is
+    # consistent with the other separator classes.
     cid = await _store("The project lives in the memory-vault repository.")
 
     lex = await _lexemes(cid)
     assert not any("-" in word for word in lex), f"hyphen survived in lexemes: {lex}"
 
     tsq = _build_tsquery("memory vault repository")
-    assert tsq is not None
     assert await _fts_matches(tsq, cid)
 
 
@@ -104,7 +107,6 @@ async def test_tilde_alias_is_findable():
     cid = await _store("Subagent pin: ~anthropic/claude-opus-latest via OpenRouter.")
 
     tsq = _build_tsquery("claude opus latest")
-    assert tsq is not None
     assert await _fts_matches(tsq, cid)
 
 
@@ -120,6 +122,10 @@ async def test_email_and_host_forms_split():
 
 
 async def test_unicode_words_survive_normalisation():
+    ctype = await fetch_one("SELECT datctype FROM pg_database WHERE datname = current_database()")
+    if "utf8" not in ctype["datctype"].lower():
+        pytest.skip(f"[[:alnum:]] is ASCII-only under ctype {ctype['datctype']}")
+
     cid = await _store("Déployé le café service with a naïve caching layer.")
 
     # Accented words must stay whole (no ASCII mangling); the stemmer still
@@ -151,8 +157,7 @@ async def test_migration_re_lexes_rows_indexed_by_old_trigger():
 
     lex = await _lexemes(cid)
     assert not any("/" in word for word in lex), f"backfill left slash lexemes: {lex}"
-    tsq = _build_tsquery("qwen3 8 2 4t a95b")
-    assert tsq is not None
+    tsq = _build_tsquery("qwen3.8-2.4t-a95b")
     assert await _fts_matches(tsq, cid)
 
 
@@ -167,12 +172,50 @@ async def test_backfill_expression_matches_trigger_expression():
         "café naïve //--.. trailing-"
     )
     cid = await _store(corpus)
-    before = await fetch_one("SELECT content_tsv::text AS tsv FROM chunks WHERE id = %s", (cid,))
+    before = await fetch_one(
+        "SELECT content_tsv::text AS tsv, xmin FROM chunks WHERE id = %s", (cid,)
+    )
 
     await execute_query(MIGRATION.read_text(), commit=True)
 
-    after = await fetch_one("SELECT content_tsv::text AS tsv FROM chunks WHERE id = %s", (cid,))
+    after = await fetch_one(
+        "SELECT content_tsv::text AS tsv, xmin FROM chunks WHERE id = %s", (cid,)
+    )
     assert before["tsv"] == after["tsv"], (
         "backfill expression disagrees with the trigger; a re-run of the "
         "migration must be a no-op on trigger-produced rows"
     )
+    # xmin changes on any row rewrite: proving equality is not enough, the
+    # IS DISTINCT FROM guard must actually SKIP the row.
+    assert before["xmin"] == after["xmin"], "unchanged row was rewritten anyway"
+
+
+async def test_update_path_re_lexes_content():
+    # The trigger fires on UPDATE OF content too, not only INSERT.
+    cid = await _store("Original wording with model/pin separators.")
+
+    await execute_query(
+        "UPDATE chunks SET content = %s WHERE id = %s",
+        ("Replaced wording about openrouter/qwen/qwen3.8-2.4t-a95b.", cid),
+        commit=True,
+    )
+
+    tsq = _build_tsquery("openrouter qwen qwen3")
+    assert await _fts_matches(tsq, cid)
+    assert "separators" not in await _lexemes(cid)
+
+
+async def test_recall_finds_identifier_end_to_end():
+    # The user-visible symptom, through the real search path: before the fix
+    # the FTS arm contributed nothing for identifier queries and the vector
+    # arm alone missed them on a small corpus.
+    import json
+
+    stored = json.loads(
+        await mcp_server.remember(
+            text="Pinned ANTHROPIC_DEFAULT_OPUS/SONNET/HAIKU_MODEL in the shell rc."
+        )
+    )
+
+    res = json.loads(await mcp_server.recall(query="ANTHROPIC_DEFAULT_OPUS_MODEL", limit=10))
+    assert stored["chunk_id"] in [r["chunk_id"] for r in res["results"]]
