@@ -311,12 +311,17 @@ async def recall_exact(
     """
     Search memories for chunks that contain the query as literal text.
 
-    Case-insensitive substring match (per the database collation) — no
+    Case-insensitive substring match (per the database collation, with no
+    unicode normalisation — an NFC query will not find NFD-stored text) — no
     embeddings, no ranking. Use it when you know exact wording (an identifier,
     path, name, or error string) and need ground truth on whether it is
     stored, or to retrieve that specific memory. Complements recall, whose
     ranking can miss exact identifiers. Results are budgeted to fit within
     max_tokens.
+
+    Matches chunk content only (not metadata or headings), newest-first, at
+    most `limit` results — not exhaustive. `more_matches` says when further
+    matches exist beyond the page.
 
     Args:
         query: The exact text to search for. Wildcards (%, _) are matched
@@ -324,10 +329,14 @@ async def recall_exact(
         spaces: Filter to specific memory spaces (e.g. ["default", "projects"]).
                 If omitted, searches all spaces.
         limit: Maximum number of results (default 10, max 50).
-        max_tokens: Token budget for results (default 2000).
+        max_tokens: Token budget for results (default 2000, clamped to 200-8000).
     """
     if not query.strip():
         return _dumps({"status": "error", "results": [], "message": "Query must not be empty."})
+    if len(query) > 500:
+        return _dumps(
+            {"status": "error", "results": [], "message": "Query too long (max 500 characters)."}
+        )
 
     if not await _ensure_db():
         return _dumps(
@@ -344,9 +353,12 @@ async def recall_exact(
         limit = min(max(limit, 1), 50)
         max_tokens = min(max(max_tokens, 200), 8000)
 
+        # E'\\' is the portable one-character backslash literal: an E-string
+        # reads the same with standard_conforming_strings on AND off, unlike
+        # a plain quoted backslash.
         where = [
             "(c.metadata->>'forgotten')::boolean IS NOT TRUE",
-            "c.content ILIKE %s ESCAPE '\\'",
+            "c.content ILIKE %s ESCAPE E'\\\\'",
         ]
         params: list = ["%" + _escape_like(query) + "%"]
 
@@ -361,7 +373,9 @@ async def recall_exact(
             else:
                 where.append("false")
 
-        params.append(limit)
+        # Fetch one extra row to report whether more matches exist beyond
+        # the page; total_results is the page size, not the full count.
+        params.append(limit + 1)
 
         start = time.perf_counter()
         rows = await fetch_all(
@@ -371,12 +385,15 @@ async def recall_exact(
             FROM chunks c
             JOIN memory_spaces ms ON ms.id = c.space_id
             WHERE {" AND ".join(where)}
-            ORDER BY c.created_at DESC
+            ORDER BY c.created_at DESC, c.id DESC
             LIMIT %s
             """,
             tuple(params),
         )
         elapsed_ms = int((time.perf_counter() - start) * 1000)
+
+        more_matches = len(rows) > limit
+        rows = rows[:limit]
 
         # log_query derives result_count and top_similarity from its results
         # argument; pass the real rows so successful exact searches are not
@@ -394,7 +411,7 @@ async def recall_exact(
             )
             for row in rows
         ]
-        await log_query(query, space_ids or None, logged, elapsed_ms)
+        await log_query(query, space_ids, logged, elapsed_ms)
 
         formatted = []
         for row in rows:
@@ -413,11 +430,18 @@ async def recall_exact(
 
         budgeted, was_truncated = _budget_results(formatted, max_tokens)
 
+        # An exact-lookup tool must not silently return content that differs
+        # from what is stored: mark every entry the budgeter shortened.
+        original_lengths = {e["chunk_id"]: len(e["content"]) for e in formatted}
+        for entry in budgeted:
+            entry["truncated"] = len(entry["content"]) < original_lengths[entry["chunk_id"]]
+
         response = {
             "status": "ok",
             "results": budgeted,
             "total_results": len(rows),
             "results_shown": len(budgeted),
+            "more_matches": more_matches,
             "query_time_ms": elapsed_ms,
         }
         if was_truncated:

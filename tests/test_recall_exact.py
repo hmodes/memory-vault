@@ -29,9 +29,10 @@ async def _ids(response: str) -> list[str]:
 
 async def test_finds_literal_substring_case_insensitively():
     cid = await _store("The dhcpd dispatcher lives at /etc/NetworkManager/dispatcher.d/.")
+    await _store("An unrelated note about the weather in Schwenksville.")
 
     ids = await _ids(await mcp_server.recall_exact(query="DHCPD DISPATCHER"))
-    assert cid in ids
+    assert ids == [cid], "must match the substring and nothing else"
 
 
 async def test_underscore_is_literal_not_wildcard():
@@ -80,7 +81,9 @@ async def test_forgotten_chunks_excluded():
     assert cid in await _ids(await mcp_server.recall_exact(query="zfs scrub"))
 
     await mcp_server.forget(cid)
-    assert cid not in await _ids(await mcp_server.recall_exact(query="zfs scrub"))
+    res = json.loads(await mcp_server.recall_exact(query="zfs scrub"))
+    assert res["status"] == "ok", "an error response would also yield no ids"
+    assert cid not in [r["chunk_id"] for r in res["results"]]
 
 
 async def test_space_filter_and_unknown_space():
@@ -93,11 +96,9 @@ async def test_space_filter_and_unknown_space():
     assert cid in ids
 
     assert await _ids(await mcp_server.recall_exact(query="deploy key rotated")) == [cid]
-    assert (
-        await _ids(await mcp_server.recall_exact(query="deploy key rotated", spaces=["default"]))
-        == []
-    )
-    # Unknown space: zero rows, never a silent widening to every space.
+    res = json.loads(await mcp_server.recall_exact(query="deploy key rotated", spaces=["default"]))
+    assert res["status"] == "ok"
+    assert res["results"] == []
     # Unknown space: zero rows, never a silent widening to every space, and
     # the response shape stays identical to a normal search.
     res = json.loads(
@@ -121,3 +122,39 @@ async def test_limit_caps_results():
 async def test_empty_query_rejected():
     res = json.loads(await mcp_server.recall_exact(query="   "))
     assert res["status"] == "error"
+
+
+async def test_more_matches_flags_results_beyond_the_page():
+    for i in range(5):
+        await _store(f"Benchmark run number {i} of the nightly suite.")
+
+    res = json.loads(await mcp_server.recall_exact(query="nightly suite", limit=2))
+    assert len(res["results"]) == 2
+    assert res["total_results"] == 2
+    assert res["more_matches"] is True
+
+    res = json.loads(await mcp_server.recall_exact(query="nightly suite", limit=50))
+    assert res["more_matches"] is False
+
+
+async def test_overlong_query_rejected():
+    res = json.loads(await mcp_server.recall_exact(query="a" * 501))
+    assert res["status"] == "error"
+    assert "too long" in res["message"]
+
+
+async def test_budget_truncation_is_marked_per_entry():
+    await _store("The zebra marker " + "padding text " * 400 + " end of the zebra marker.")
+
+    res = json.loads(await mcp_server.recall_exact(query="zebra marker", max_tokens=200))
+    assert res["results"], "expected a match"
+    entry = res["results"][0]
+    assert entry["truncated"] is True
+    assert res["note"].startswith("Some results were truncated")
+
+
+async def test_untruncated_entries_marked_false():
+    await _store("Short quokka note.")
+
+    res = json.loads(await mcp_server.recall_exact(query="quokka"))
+    assert res["results"][0]["truncated"] is False
