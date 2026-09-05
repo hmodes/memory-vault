@@ -52,6 +52,7 @@ from memory_vault.models.db import (  # noqa: E402
 from memory_vault.services.embedding import MODEL_NAME, embed  # noqa: E402
 from memory_vault.services.ingestion import _run_extraction  # noqa: E402
 from memory_vault.services.search import (  # noqa: E402
+    SearchResult,
     hybrid_search,
     log_query,
     parse_since,
@@ -310,11 +311,12 @@ async def recall_exact(
     """
     Search memories for chunks that contain the query as literal text.
 
-    Case-insensitive substring match — no embeddings, no ranking. Use it when
-    you know exact wording (an identifier, path, name, or error string) and
-    need ground truth on whether it is stored, or to retrieve that specific
-    memory. Complements recall, whose ranking can miss exact identifiers.
-    Results are budgeted to fit within max_tokens.
+    Case-insensitive substring match (per the database collation) — no
+    embeddings, no ranking. Use it when you know exact wording (an identifier,
+    path, name, or error string) and need ground truth on whether it is
+    stored, or to retrieve that specific memory. Complements recall, whose
+    ranking can miss exact identifiers. Results are budgeted to fit within
+    max_tokens.
 
     Args:
         query: The exact text to search for. Wildcards (%, _) are matched
@@ -342,18 +344,22 @@ async def recall_exact(
         limit = min(max(limit, 1), 50)
         max_tokens = min(max(max_tokens, 200), 8000)
 
-        where = ["(c.metadata->>'forgotten')::boolean IS NOT TRUE", "c.content ILIKE %s"]
+        where = [
+            "(c.metadata->>'forgotten')::boolean IS NOT TRUE",
+            "c.content ILIKE %s ESCAPE '\\'",
+        ]
         params: list = ["%" + _escape_like(query) + "%"]
 
-        # Unknown space names resolve to []; return zero rows rather than
-        # silently widening to every space (same semantics as hybrid_search).
+        # Unknown space names resolve to []; a hard-false predicate returns
+        # zero rows rather than silently widening to every space (same
+        # semantics as hybrid_search), through the common response/logging
+        # path rather than a special-cased early return.
         if space_ids is not None:
-            if not space_ids:
-                return _dumps(
-                    {"status": "ok", "results": [], "total_results": 0, "results_shown": 0}
-                )
-            where.append(f"c.space_id IN ({', '.join(['%s'] * len(space_ids))})")
-            params.extend(space_ids)
+            if space_ids:
+                where.append(f"c.space_id IN ({', '.join(['%s'] * len(space_ids))})")
+                params.extend(space_ids)
+            else:
+                where.append("false")
 
         params.append(limit)
 
@@ -372,7 +378,23 @@ async def recall_exact(
         )
         elapsed_ms = int((time.perf_counter() - start) * 1000)
 
-        await log_query(query, space_ids or None, [], elapsed_ms)
+        # log_query derives result_count and top_similarity from its results
+        # argument; pass the real rows so successful exact searches are not
+        # logged as zero-result misses. Exact search computes no vector
+        # similarity, so it is left None (NULL in query_log).
+        logged = [
+            SearchResult(
+                chunk_id=str(row["chunk_id"]),
+                content=row["content"],
+                similarity=None,
+                speaker=row["speaker"],
+                space=row["space"],
+                source=row["source"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+        await log_query(query, space_ids or None, logged, elapsed_ms)
 
         formatted = []
         for row in rows:

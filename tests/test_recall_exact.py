@@ -52,6 +52,29 @@ async def test_percent_is_literal_not_wildcard():
     assert len(ids) == 1, "percent must not act as a wildcard"
 
 
+async def test_backslash_is_literal():
+    kept = await _store(r"Windows path C:\temp\ kept verbatim.")
+    await _store("Windows path C temp kept verbatim.")
+
+    ids = await _ids(await mcp_server.recall_exact(query=r"C:\temp"))
+    assert kept in ids
+    assert len(ids) == 1
+
+    trailing = await _ids(await mcp_server.recall_exact(query="temp\\"))
+    assert trailing == [kept]
+
+
+async def test_backslash_wildcard_combinations_are_literal():
+    # Negative control: if escaping were broken, an unescaped \% / \_ would
+    # degrade to literal % / _ and match this chunk too.
+    kept = await _store(r"Literal \% and \_ sequences stay intact here.")
+    await _store("Plain percent and underscore: % and _ without backslashes.")
+
+    ids = await _ids(await mcp_server.recall_exact(query=r"\% and \_"))
+    assert kept in ids
+    assert len(ids) == 1, "backslash-wildcard combos must match literally"
+
+
 async def test_forgotten_chunks_excluded():
     cid = await _store("Transient note about the zfs scrub schedule.")
     assert cid in await _ids(await mcp_server.recall_exact(query="zfs scrub"))
@@ -75,12 +98,15 @@ async def test_space_filter_and_unknown_space():
         == []
     )
     # Unknown space: zero rows, never a silent widening to every space.
-    assert (
-        await _ids(
-            await mcp_server.recall_exact(query="deploy key rotated", spaces=["no-such-space"])
-        )
-        == []
+    # Unknown space: zero rows, never a silent widening to every space, and
+    # the response shape stays identical to a normal search.
+    res = json.loads(
+        await mcp_server.recall_exact(query="deploy key rotated", spaces=["no-such-space"])
     )
+    assert res["status"] == "ok"
+    assert res["results"] == []
+    assert res["total_results"] == 0
+    assert "query_time_ms" in res
 
 
 async def test_limit_caps_results():
